@@ -4,3 +4,4 @@ pyromod
 aiohttp
 motor
 dnspython
+opencv-python
