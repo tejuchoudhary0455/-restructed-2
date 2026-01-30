@@ -1,163 +1,150 @@
-import os, asyncio, shutil, time, sys, cv2
+import os, asyncio, time, re
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyromod import listen
-from aiohttp import web
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 API_ID = int(os.environ.get("API_ID", "23708017"))
 API_HASH = os.environ.get("API_HASH", "bb43c2e9f011dea16cad362d56c889b6")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8422932464:AAEhXencYfAL108lGAjEGySXw_9nwvUhm3o")
-OWNER = int(os.environ.get("OWNER", "1306149967"))
-CREDIT = "Teju"
+MONGO_URI = "mongodb+srv://tejuchoudhary0456_db_user:rQiNVxZvKfDAWVzA@teju.1z1ohk0.mongodb.net/?appName=Teju"
 
-# Max speed ke liye workers badhaye hain
-bot = Client("SamratBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=100)
-user = Client("SamratUserV7", api_id=API_ID, api_hash=API_HASH, workers=100) 
+bot = Client("SamratBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+db = AsyncIOMotorClient(MONGO_URI)['SamratBot']
+user_sessions = db['sessions']
 
-PREMIUM_USERS = [OWNER] 
+stop_batch = {}
 
-async def web_server():
-    app = web.Application()
-    app.add_routes([web.get('/', lambda request: web.Response(text="Teju's Bot is Running Fast!"))])
-    return app
+# --- OTP LOGIN LOGIC ---
+async def login_with_otp(client, message):
+    try:
+        phone_ask = await bot.ask(message.chat.id, "📲 अपना **Mobile Number** भेजें (Country Code के साथ, e.g. +919876543210):", timeout=300)
+        phone_number = phone_ask.text.replace(" ", "")
+        
+        # Temporary client for OTP
+        temp_client = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
+        await temp_client.connect()
+        
+        try:
+            code_data = await temp_client.send_code(phone_number)
+        except Exception as e:
+            return await message.reply(f"❌ **Error:** `{str(e)}`")
 
-async def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    runner = web.AppRunner(await web_server())
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', port).start()
+        otp_ask = await bot.ask(message.chat.id, "📩 आपके Telegram पर एक **OTP** आया है। उसे यहाँ लिखें (Format: 1 2 3 4 5):", timeout=300)
+        otp_code = otp_ask.text.replace(" ", "")
 
-# --- THUMBNAIL GENERATOR ---
-def generate_thumbnail(video_path):
-    thumb_path = f"{video_path}.jpg"
-    cap = cv2.VideoCapture(video_path)
-    ret, frame = cap.read()
-    if ret:
-        cv2.imwrite(thumb_path, frame)
-        cap.release()
-        return thumb_path
-    cap.release()
-    return None
+        try:
+            await temp_client.sign_in(phone_number, code_data.phone_code_hash, otp_code)
+        except SessionPasswordNeeded:
+            # 2-Step Verification
+            pwd_ask = await bot.ask(message.chat.id, "🔐 आपके अकाउंट पर **2-Step Verification** लगा है। अपना Password भेजें:", timeout=300)
+            await temp_client.check_password(pwd_ask.text)
+        except (PhoneCodeInvalid, PhoneCodeExpired):
+            return await message.reply("❌ OTP गलत है या एक्सपायर हो गया है।")
+
+        # Session String Generation
+        string_session = await temp_client.export_session_string()
+        await user_sessions.update_one({"user_id": message.from_user.id}, {"$set": {"session": string_session}}, upsert=True)
+        
+        me = await temp_client.get_me()
+        await message.reply(f"✅ **Login Successful!**\nWelcome {me.first_name}\n\nAb aap links bhej sakte hain.")
+        await temp_client.disconnect()
+
+    except Exception as e:
+        await message.reply(f"❌ **Login Failed:** `{str(e)}`")
+
+# --- START & CALLBACK ---
+@bot.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    buttons = [[InlineKeyboardButton("🔐 OTP Login", callback_data="otp_login")],
+               [InlineKeyboardButton("📊 Status", callback_data="bot_status")]]
+    await message.reply_text("🏆 **𝐒𝐀𝐌𝐑𝐀𝐓 𝟓𝐆 𝐁𝐎𝐓** 🏆\n\nAb Restricted Content download karein bina session ke tension ke!", reply_markup=InlineKeyboardMarkup(buttons))
+
+@bot.on_callback_query()
+async def callbacks(client, query: CallbackQuery):
+    if query.data == "otp_login":
+        await query.message.delete()
+        await login_with_otp(client, query.message)
+    elif query.data == "stop":
+        stop_batch[query.from_user.id] = True
+        await query.answer("🛑 Batch Stopped!", show_alert=True)
 
 # --- PROGRESS BAR ---
-async def progress_bar(current, total, message, start_time, action):
+async def progress_bar(current, total, status_msg, start_time):
     now = time.time()
     diff = now - start_time
-    if round(diff % 3.00) == 0 or current == total: # Interval kam kiya for fast updates
+    if round(diff % 4.00) == 0 or current == total:
         percentage = current * 100 / total
-        speed = current / (diff if diff > 0 else 1)
-        progress_ui = "▰" * int(percentage / 10) + "▱" * (10 - int(percentage / 10))
-        tmp = (
-            f"⚡ **𝐒𝐚𝐦𝐫𝐚𝐭 {action}...**\n\n"
-            f"📊 **𝐒𝐭𝐚𝐭𝐮𝐬:** `{progress_ui}` **{round(percentage, 2)}%**\n"
-            f"🚀 **𝐒𝐩𝐞𝐞𝐝:** `{round(speed / 1024 / 1024, 2)} MB/s`"
-        )
-        try: await message.edit(tmp)
+        speed = current / diff if diff > 0 else 0
+        bar = "🟢" * int(percentage/10) + "⚪" * (10 - int(percentage/10))
+        try:
+            await status_msg.edit(
+                f"📥 **Downloading...**\n`{bar}` {round(percentage, 2)}%\n⚡ **Speed:** {round(speed / 1024, 2)} KB/s",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop", callback_data="stop")]])
+            )
         except: pass
 
-# --- MEDIA HANDLER ---
-async def download_and_send(client, message, chat_id, msg_id):
-    if not user.is_connected: await user.start()
-    
-    try:
-        content = await user.get_messages(chat_id, msg_id)
-    except:
-        try:
-            await user.join_chat(chat_id)
-            content = await user.get_messages(chat_id, msg_id)
-        except: return False
-
-    if not content or content.empty: return False
-    
-    p = await bot.send_message(message.chat.id, f"📥 **𝐄𝐱𝐭𝐫𝐚𝐜𝐭𝐢𝐧𝐠:** `{msg_id}`...")
-    cap = content.caption if content.caption else f"✨ **𝐒𝐚𝐯𝐞 𝐛𝐲 {CREDIT}**"
-
-    if not content.media:
-        await bot.send_message(message.chat.id, content.text if content.text else "Empty")
-        await p.delete()
-        return True
-
-    st = time.time()
-    try:
-        # Download with Max Speed
-        file = await user.download_media(content, progress=progress_bar, progress_args=(p, st, "Downloading"))
-        if not file: return False
-
-        await p.edit("⬆️ **𝐔𝐩𝐥𝐨𝐚𝐝𝐢𝐧𝐠 𝐰𝐢𝐭𝐡 𝐓𝐡𝐮𝐦𝐛𝐧𝐚𝐢𝐥...**")
-        
-        if content.video:
-            thumb = generate_thumbnail(file)
-            await bot.send_video(
-                message.chat.id, file, caption=cap, 
-                thumb=thumb, supports_streaming=True, 
-                progress=progress_bar, progress_args=(p, time.time(), "Uploading")
-            )
-            if thumb and os.path.exists(thumb): os.remove(thumb)
-        elif content.photo:
-            await bot.send_photo(message.chat.id, file, caption=cap)
-        else:
-            await bot.send_document(message.chat.id, file, caption=cap, 
-                                    progress=progress_bar, progress_args=(p, time.time(), "Uploading"))
-        
-        if os.path.exists(file): os.remove(file)
-        await p.delete()
-        return True
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await download_and_send(client, message, chat_id, msg_id)
-    except Exception as e:
-        await p.edit(f"❌ **Error:** `{e}`")
-        return False
-
+# --- DOWNLOAD HANDLER ---
 @bot.on_message(filters.text & filters.private)
-async def handle_links(client, message):
+async def main_handler(client, message):
     if "t.me/" not in message.text: return
-    if message.chat.id not in PREMIUM_USERS: return await message.reply("❌ Buy Premium.")
     
-    link = message.text.strip().rstrip('/')
-    parts = link.split("/")
-    
+    # Check Session from DB
+    data = await user_sessions.find_one({"user_id": message.from_user.id})
+    if not data:
+        return await message.reply("❌ Pehle login karein!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login Now", callback_data="otp_login")]]))
+
+    link = message.text.strip()
     try:
-        start_id = int(parts[-1])
-        chat_id = int("-100" + parts[-2]) if "t.me/c/" in link else parts[-2]
-            
-        ask_batch = await bot.ask(message.chat.id, "🔢 **Kitni posts?**")
-        count = int(ask_batch.text)
+        if "t.me/c/" in link: chat_id = int("-100" + link.split("/")[-2])
+        else: chat_id = link.split("/")[-2]
+        msg_id = int(link.split("/")[-1])
+    except: return await message.reply("❌ Invalid Link!")
+
+    wm = await bot.ask(message.chat.id, "🖋️ **Watermark Likhein:**")
+    count = await bot.ask(message.chat.id, "🔢 **Count:**")
+    
+    u_bot = Client("SamratUser", api_id=API_ID, api_hash=API_HASH, session_string=data['session'])
+    await u_bot.start()
+    
+    stop_batch[message.from_user.id] = False
+    
+    for i in range(int(count.text)):
+        if stop_batch.get(message.from_user.id): break
+        curr_id = msg_id + i
+        sts = await bot.send_message(message.chat.id, f"📡 **Processing ID:** `{curr_id}`")
         
-        for i in range(count):
-            if not await download_and_send(client, message, chat_id, start_id + i): break
-            await asyncio.sleep(1) # Speed ke liye delay kam kiya
-            
-        await message.reply("✅ **Batch Complete!**")
-    except Exception as e:
-        await message.reply(f"❌ **Error:** `{e}`")
+        try:
+            msg = await u_bot.get_messages(chat_id, curr_id)
+            if not (msg and not msg.empty): continue
 
-# --- LOGIN & START ---
-@bot.on_callback_query(filters.regex("login"))
-async def login_cb(client, cb):
-    await cb.answer()
-    ph = await bot.ask(cb.message.chat.id, "📱 **Enter Number with +91:**")
-    phone = ph.text.strip()
-    if not user.is_connected: await user.connect()
-    try:
-        ch = await user.send_code(phone)
-        otp_ask = await bot.ask(cb.message.chat.id, "📩 **Enter OTP:**")
-        await user.sign_in(phone, ch.phone_code_hash, otp_ask.text.replace(" ", ""))
-        await bot.send_message(cb.message.chat.id, "🎉 **Login Success!**")
-    except Exception as e: await bot.send_message(cb.message.chat.id, f"❌ {e}")
+            if not msg.media:
+                await bot.send_message(message.chat.id, f"{msg.text}\n\n{wm.text}")
+            else:
+                st_t = time.time()
+                file = await u_bot.download_media(msg, progress=progress_bar, progress_args=(sts, st_t))
+                
+                await sts.edit("⬆️ **Uploading...**")
+                cap = f"{msg.caption if msg.caption else ''}\n\n{wm.text}"
+                
+                if msg.video: await bot.send_video(message.chat.id, file, caption=cap, supports_streaming=True)
+                elif msg.photo: await bot.send_photo(message.chat.id, file, caption=cap)
+                else: await bot.send_document(message.chat.id, file, caption=cap)
 
-@bot.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, message):
-    await bot.send_photo(message.chat.id, photo="https://telegra.ph/file/0998a44c45b78f4477813.jpg", 
-                         caption="🔥 **High Speed Bot Ready!**", 
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Login", callback_data="login")]]))
+                if file and os.path.exists(file): os.remove(file)
+            await sts.delete()
+            await asyncio.sleep(2)
+        except Exception as e:
+            await bot.send_message(message.chat.id, f"❌ Error `{curr_id}`: {e}")
+
+    await u_bot.stop()
+    await message.reply("✅ **Batch Done!**")
 
 async def main():
     await bot.start()
-    asyncio.create_task(run_web_server())
-    print("🚀 FAST BOT READY!")
+    print("Samrat 5G Pro is Active with OTP Login!")
     await idle()
 
 if __name__ == "__main__":
